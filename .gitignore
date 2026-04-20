@@ -52,3 +52,6 @@ server.log
 
 # Local overrides
 claude_desktop_config.json
+
+# Claude Code local settings
+.claude/settings.local.json
