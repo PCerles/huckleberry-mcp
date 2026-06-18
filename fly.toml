@@ -6,7 +6,7 @@ primary_region = "iad"
 [env]
   MCP_TRANSPORT = "streamable-http"
   PORT = "8080"
-  HUCKLEBERRY_TIMEZONE = "America/New_York"
+  HUCKLEBERRY_TIMEZONE = "America/Los_Angeles"
   OAUTH_STATE_PATH = "/data/oauth_state.pkl"
 
 [[mounts]]
