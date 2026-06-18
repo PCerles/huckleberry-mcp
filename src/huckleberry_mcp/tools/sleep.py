@@ -2,12 +2,40 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
+
+from huckleberry_api.firebase_types import FirebaseSleepDetails
 
 from ..auth import get_api
 from ..utils import parse_dt, to_local_iso
 from .children import validate_child_uid
+
+
+async def _patch_live_timer(
+    api: Any,
+    child_uid: str,
+    *,
+    start_dt: datetime | None = None,
+    notes: str | None = None,
+) -> None:
+    """Override fields on the active sleep timer doc after it's created.
+
+    ``huckleberry-api``'s ``start_sleep`` hardcodes the start time to now and
+    exposes no hook for notes, so we patch the firestore doc directly. We only
+    touch fields the upstream timer structure already defines:
+    ``timer.timerStartTime`` (ms; what ``complete_sleep`` reads for duration)
+    and ``timer.details.notes`` (copied into the saved interval on completion).
+    """
+    updates: dict[str, Any] = {}
+    if start_dt is not None:
+        updates["timer.timerStartTime"] = start_dt.timestamp() * 1000
+    if notes is not None:
+        updates["timer.details.notes"] = notes
+    if not updates:
+        return
+    client = await api._get_firestore_client()
+    await client.collection("sleep").document(child_uid).update(updates)
 
 
 async def log_sleep(
@@ -16,12 +44,16 @@ async def log_sleep(
     start_time: str,
     end_time: str | None = None,
     duration_minutes: int | None = None,
+    notes: str | None = None,
 ) -> dict[str, Any]:
     """Retroactively log a completed sleep session.
 
     Provide EITHER end_time OR duration_minutes.
     Times are interpreted in America/New_York (EST/EDT) unless the input
     carries an explicit offset.
+
+    notes: free-form text stored on the saved interval (e.g. a JSON blob
+    describing how she was put down). Returned by get_sleep_history.
     """
     child_uid = await validate_child_uid(child_uid)
     api = await get_api()
@@ -38,7 +70,8 @@ async def log_sleep(
     if end_dt <= start_dt:
         raise ValueError("end_time must be after start_time")
 
-    await api.log_sleep(child_uid, start_time=start_dt, end_time=end_dt)
+    details = FirebaseSleepDetails(notes=notes) if notes else None
+    await api.log_sleep(child_uid, start_time=start_dt, end_time=end_dt, details=details)
     total = int((end_dt - start_dt).total_seconds() / 60)
     return {
         "success": True,
@@ -46,15 +79,39 @@ async def log_sleep(
         "start_time": to_local_iso(start_dt),
         "end_time": to_local_iso(end_dt),
         "duration_minutes": total,
+        "notes": notes,
     }
 
 
-async def start_sleep(child_uid: str | None = None) -> dict[str, Any]:
-    """Start a sleep timer."""
+async def start_sleep(
+    child_uid: str | None = None,
+    *,
+    start_time: str | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Start a live sleep timer, optionally backdated.
+
+    start_time: when sleep actually began. Use this when she fell asleep
+        earlier and you're only starting the timer now (e.g. "started 40 min
+        ago"). Naive times are America/New_York (EST/EDT). Defaults to now.
+        The timer stays live — call complete_sleep when she wakes and the
+        duration is measured from this start.
+    notes: free-form text stored on the session (e.g. a JSON blob describing
+        how she was put down). Carried into the saved interval on completion.
+    """
     child_uid = await validate_child_uid(child_uid)
     api = await get_api()
+    start_dt = parse_dt(start_time, default_now=False) if start_time else None
+    if start_dt is not None and start_dt > datetime.now(start_dt.tzinfo):
+        raise ValueError("start_time is in the future")
     await api.start_sleep(child_uid)
-    return {"success": True, "message": "Started sleep timer"}
+    await _patch_live_timer(api, child_uid, start_dt=start_dt, notes=notes)
+    if start_dt is not None:
+        elapsed = int((datetime.now(start_dt.tzinfo) - start_dt).total_seconds() / 60)
+        message = f"Started sleep timer, backdated {elapsed} min to {to_local_iso(start_dt)}"
+    else:
+        message = "Started sleep timer"
+    return {"success": True, "message": message, "notes": notes}
 
 
 async def pause_sleep(child_uid: str | None = None) -> dict[str, Any]:
@@ -71,12 +128,23 @@ async def resume_sleep(child_uid: str | None = None) -> dict[str, Any]:
     return {"success": True, "message": "Resumed sleep timer"}
 
 
-async def complete_sleep(child_uid: str | None = None) -> dict[str, Any]:
-    """Complete and save the active sleep timer."""
+async def complete_sleep(
+    child_uid: str | None = None,
+    *,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Complete and save the active sleep timer.
+
+    notes: free-form text (e.g. a JSON blob of how she was put down) attached
+        to the saved interval. Overrides any notes set at start_sleep time.
+    """
     child_uid = await validate_child_uid(child_uid)
     api = await get_api()
+    # Patch notes onto the live timer first; complete_sleep copies timer.details
+    # into the saved interval.
+    await _patch_live_timer(api, child_uid, notes=notes)
     await api.complete_sleep(child_uid)
-    return {"success": True, "message": "Completed sleep"}
+    return {"success": True, "message": "Completed sleep", "notes": notes}
 
 
 async def cancel_sleep(child_uid: str | None = None) -> dict[str, Any]:
@@ -105,11 +173,13 @@ async def get_sleep_history(
         start = getattr(iv, "start", None)
         duration = getattr(iv, "duration", 0) or 0
         end = getattr(iv, "end", None)
+        details = getattr(iv, "details", None)
         out.append(
             {
                 "start_time": to_local_iso(start) if start is not None else None,
                 "end_time": to_local_iso(end) if end is not None else None,
                 "duration_minutes": int(duration // 60) if duration else 0,
+                "notes": getattr(details, "notes", None) if details else None,
             }
         )
     return out
