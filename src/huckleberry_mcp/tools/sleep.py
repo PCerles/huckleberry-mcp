@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
+from google.cloud import firestore
 from huckleberry_api.firebase_types import FirebaseSleepDetails
 
 from ..auth import get_api
@@ -154,6 +156,112 @@ async def cancel_sleep(child_uid: str | None = None) -> dict[str, Any]:
     return {"success": True, "message": "Cancelled sleep timer"}
 
 
+async def update_sleep(
+    child_uid: str | None = None,
+    *,
+    match_start_time: str,
+    new_start_time: str | None = None,
+    new_end_time: str | None = None,
+    new_duration_minutes: int | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Edit an existing saved sleep interval in place (no duplicate created).
+
+    The underlying API has no edit method, so the interval is located by its
+    current start time and the firestore doc is patched directly. Use this to
+    attach notes to a past sleep, or correct its start/duration.
+
+    match_start_time: the interval's CURRENT start — copy it verbatim from
+        get_sleep_history so it resolves to the same instant. Matching is by
+        absolute time, so an explicit offset (e.g. "...-04:00") is honored.
+    new_start_time: corrected start. If given without a new duration/end, the
+        original END is held fixed and duration shrinks/grows accordingly.
+    new_end_time / new_duration_minutes: provide at most one.
+    notes: free-form text (e.g. a JSON blob of how she was put down).
+    """
+    child_uid = await validate_child_uid(child_uid)
+    if new_end_time is not None and new_duration_minutes is not None:
+        raise ValueError("Provide new_end_time OR new_duration_minutes, not both")
+    api = await get_api()
+
+    match_dt = parse_dt(match_start_time, default_now=False)
+    match_start_sec = int(match_dt.timestamp())
+
+    client = await api._get_firestore_client()
+    intervals_ref = client.collection("sleep").document(child_uid).collection("intervals")
+
+    # Locate the individual interval doc by exact start second. Batched "multi"
+    # containers are an older storage format we don't edit here.
+    matches: list[tuple[str, dict[str, Any]]] = []
+    docs = (
+        intervals_ref.where(filter=firestore.FieldFilter("start", ">=", match_start_sec))
+        .where(filter=firestore.FieldFilter("start", "<", match_start_sec + 1))
+        .stream()
+    )
+    async for doc in docs:
+        data = doc.to_dict() or {}
+        if data.get("multi"):
+            continue
+        matches.append((doc.id, data))
+
+    if not matches:
+        raise ValueError(
+            f"No sleep interval starts at {to_local_iso(match_dt)}. "
+            "Copy match_start_time exactly from get_sleep_history."
+        )
+    if len(matches) > 1:
+        raise ValueError(f"{len(matches)} intervals start at {to_local_iso(match_dt)}; cannot disambiguate.")
+
+    doc_id, data = matches[0]
+    old_start_sec = int(data.get("start", match_start_sec))
+    old_duration = int(data.get("duration", 0) or 0)
+    old_end_sec = old_start_sec + old_duration
+
+    start_sec = old_start_sec
+    if new_start_time is not None:
+        start_sec = int(parse_dt(new_start_time, default_now=False).timestamp())
+
+    if new_duration_minutes is not None:
+        duration_sec = new_duration_minutes * 60
+    elif new_end_time is not None:
+        duration_sec = int(parse_dt(new_end_time, default_now=False).timestamp()) - start_sec
+    elif new_start_time is not None:
+        # Start moved, no new length given: keep the original end fixed.
+        duration_sec = old_end_sec - start_sec
+    else:
+        duration_sec = old_duration
+    if duration_sec <= 0:
+        raise ValueError("Resulting duration must be positive")
+
+    updates: dict[str, Any] = {}
+    if start_sec != old_start_sec:
+        updates["start"] = start_sec
+    if duration_sec != old_duration:
+        updates["duration"] = duration_sec
+    if notes is not None:
+        updates["details.notes"] = notes
+    if not updates:
+        return {"success": True, "message": "Nothing to update", "start_time": to_local_iso(old_start_sec)}
+
+    updates["lastUpdated"] = time.time()
+    await intervals_ref.document(doc_id).update(updates)
+
+    return {
+        "success": True,
+        "message": "Updated sleep interval",
+        "before": {
+            "start_time": to_local_iso(old_start_sec),
+            "duration_minutes": old_duration // 60,
+        },
+        "after": {
+            "start_time": to_local_iso(start_sec),
+            "end_time": to_local_iso(start_sec + duration_sec),
+            "duration_minutes": duration_sec // 60,
+            "notes": notes,
+        },
+    }
+
+
 async def get_sleep_history(
     child_uid: str | None = None,
     *,
@@ -192,4 +300,5 @@ def register_sleep_tools(mcp):
     mcp.tool()(resume_sleep)
     mcp.tool()(complete_sleep)
     mcp.tool()(cancel_sleep)
+    mcp.tool()(update_sleep)
     mcp.tool()(get_sleep_history)
